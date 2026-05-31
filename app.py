@@ -71,18 +71,21 @@ def _upcoming_calendar(now, days=16):
     return "\n".join(lines)
 
 
-def parse_task(text):
+def parse_tasks(text):
+    """แยกข้อความเป็นรายการงาน รองรับหลายงานใน 1 ข้อความ -> list ของ dict (ว่าง=ไม่ใช่งาน)"""
     now = datetime.now(BANGKOK_TZ)
     calendar = _upcoming_calendar(now)
-    system = f"""คุณคือตัวช่วยแยกข้อความภาษาพูดของเจมส์ให้เป็น "งาน" คืนค่าเป็น JSON อย่างเดียวเท่านั้น ห้ามมีข้อความอื่น
+    system = f"""คุณคือตัวช่วยแยกข้อความภาษาพูดของเจมส์ให้เป็น "รายการงาน" คืนค่าเป็น JSON array อย่างเดียวเท่านั้น ห้ามมีข้อความอื่น
 
-รูปแบบ:
-{{"is_task": true/false, "title": "ชื่องานสั้นกระชับ", "due_date": "YYYY-MM-DD หรือ null", "related_order": "เลขออเดอร์ หรือ null", "note": "รายละเอียดเพิ่ม หรือ null"}}
+รูปแบบ (array ของงาน — มีกี่งานก็ได้):
+[{{"title": "ชื่องานสั้นกระชับ", "due_date": "YYYY-MM-DD หรือ null", "related_order": "เลขออเดอร์ หรือ null", "note": "รายละเอียดเพิ่ม หรือ null"}}]
 
 กฎ:
-- is_task=false ถ้าเป็นการทักทาย คำถามทั่วไป หรือไม่ใช่การสั่งให้จดงาน
+- ถ้าข้อความมีหลายงาน (bullet list, ขึ้นบรรทัดใหม่หลายอัน, คั่นด้วยจุด/เลข/ลูกศร) ให้แยกเป็นหลาย object — แต่ละงาน = 1 object
+- ถ้าเป็นการทักทาย คำถามทั่วไป หรือไม่ใช่การสั่งจดงาน ให้คืน [] (array ว่าง)
+- คำนำอย่าง "จดงาน" "งาน" "todo" "list" ไม่ใช่ชื่องาน ให้ข้าม เอาเฉพาะตัวงานจริง
 - ถ้าไม่ระบุวัน ให้ due_date=null
-- title ให้กระชับเป็นกริยา เช่น "ตามออเดอร์ 42", "โทรหาแป้งเรื่องคลิป"
+- title กระชับ เช่น "ตามออเดอร์ 42", "ทำคอนเทนต์สร้อย"
 - related_order ใส่เฉพาะตัวเลข ถ้าพูดถึงเลขออเดอร์/คิว
 
 เรื่องวันที่ — ห้ามนับวันเอง ให้ใช้ปฏิทินจริงด้านล่างนี้เทียบหาวันที่เสมอ
@@ -92,20 +95,24 @@ def parse_task(text):
     try:
         resp = claude.messages.create(
             model=PARSE_MODEL,
-            max_tokens=300,
+            max_tokens=800,
             system=system,
             messages=[{"role": "user", "content": text}],
         )
         raw = resp.content[0].text.strip()
         # strip code fences if any
         if raw.startswith('```'):
-            raw = raw.split('```')[1].lstrip('json').strip()
-        return json.loads(raw)
+            raw = raw.split('```', 2)[1].lstrip('json').strip()
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            data = [data]
+        if not isinstance(data, list):
+            return []
+        return [d for d in data if isinstance(d, dict) and d.get("title")]
     except Exception as e:
-        logger.error(f"parse_task error: {e}")
-        # fallback: treat whole text as a task title
-        return {"is_task": True, "title": text, "due_date": None,
-                "related_order": None, "note": None}
+        logger.error(f"parse_tasks error: {e}")
+        # fallback: ถือทั้งข้อความเป็น 1 งาน
+        return [{"title": text, "due_date": None, "related_order": None, "note": None}]
 
 
 # ---------------------------------------------------------------------------
@@ -267,19 +274,33 @@ def handle_message(event):
             else:
                 reply = "ไม่เจองานข้อนั้น พิมพ์ งาน เพื่อดูลิสต์ล่าสุดก่อนนะ"
         else:
-            parsed = parse_task(text)
-            if parsed.get("is_task") and parsed.get("title"):
-                insert_task(parsed)
-                reply = f"จดงานแล้ว: {parsed['title']}"
+            tasks = parse_tasks(text)
+            if not tasks:
+                reply = "รับทราบครับ\n\n" + HELP_TEXT
+            elif len(tasks) == 1:
+                t = tasks[0]
+                insert_task(t)
+                reply = f"จดงานแล้ว: {t['title']}"
                 tail = []
-                if parsed.get("related_order"):
-                    tail.append(f"ออเดอร์ {parsed['related_order']}")
-                if parsed.get("due_date"):
-                    tail.append("กำหนด " + thai_date(parsed["due_date"]))
+                if t.get("related_order"):
+                    tail.append(f"ออเดอร์ {t['related_order']}")
+                if t.get("due_date"):
+                    tail.append("กำหนด " + thai_date(t["due_date"]))
                 if tail:
                     reply += "\n(" + " - ".join(tail) + ")"
             else:
-                reply = "รับทราบครับ\n\n" + HELP_TEXT
+                for t in tasks:
+                    insert_task(t)
+                lines = [f"จดงานแล้ว {len(tasks)} งาน:"]
+                for i, t in enumerate(tasks, 1):
+                    extra = []
+                    if t.get("related_order"):
+                        extra.append(f"ออเดอร์ {t['related_order']}")
+                    if t.get("due_date"):
+                        extra.append(thai_date(t["due_date"]))
+                    suffix = (" (" + " - ".join(extra) + ")") if extra else ""
+                    lines.append(f"{i}. {t['title']}{suffix}")
+                reply = "\n".join(lines)
 
         line_bot_api.reply_message(
             ReplyMessageRequest(

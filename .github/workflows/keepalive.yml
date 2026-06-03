@@ -1,0 +1,15 @@
+name: Keep bot awake
+
+# ปิง /health ทุก 5 นาที กัน Render free tier หลับ
+# ใช้ || true เพื่อให้ step ไม่ fail (workflow จะไม่ self-disable เหมือน cron-job.org)
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        run: curl -m 90 -fsS https://prowderia-secretar.onrender.com/health || true
